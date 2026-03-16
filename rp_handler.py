@@ -38,6 +38,9 @@ encoder = None
 MODEL_ID = "resemblyzer-v1"
 EMBEDDING_DIM = 256
 AUDIO_CACHE_DIR = Path("/app/audio_cache")
+DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 5
+DOWNLOAD_READ_TIMEOUT_SECONDS = 60
+MAX_AUDIO_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # Audio helpers (unchanged core logic)
@@ -59,6 +62,7 @@ def download_cached_audio(audio_url: str) -> str:
     import requests
 
     AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cached_file = None
 
     for ext in [".wav", ".mp3", ".m4a", ".flac"]:
         cached_file = AUDIO_CACHE_DIR / get_cached_filename(audio_url, ext)
@@ -67,26 +71,60 @@ def download_cached_audio(audio_url: str) -> str:
             return str(cached_file)
 
     logger.info("Downloading audio from URL...")
-    response = requests.get(audio_url, stream=True)
-    response.raise_for_status()
+    try:
+        with requests.get(
+            audio_url,
+            stream=True,
+            timeout=(
+                DOWNLOAD_CONNECT_TIMEOUT_SECONDS,
+                DOWNLOAD_READ_TIMEOUT_SECONDS,
+            ),
+        ) as response:
+            response.raise_for_status()
 
-    file_extension = ".wav"
-    url_lower = audio_url.lower()
-    for ext in [".mp3", ".wav", ".m4a", ".flac"]:
-        if url_lower.endswith(ext):
-            file_extension = ext
-            break
-    else:
-        content_type = response.headers.get("content-type", "").lower()
-        if "mp3" in content_type or "mpeg" in content_type:
-            file_extension = ".mp3"
-        elif "flac" in content_type:
-            file_extension = ".flac"
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > MAX_AUDIO_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"Audio download exceeds the {MAX_AUDIO_DOWNLOAD_BYTES} byte limit"
+                )
 
-    cached_file = AUDIO_CACHE_DIR / get_cached_filename(audio_url, file_extension)
-    with open(cached_file, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+            file_extension = ".wav"
+            url_lower = audio_url.lower()
+            for ext in [".mp3", ".wav", ".m4a", ".flac"]:
+                if url_lower.endswith(ext):
+                    file_extension = ext
+                    break
+            else:
+                content_type = response.headers.get("content-type", "").lower()
+                if "mp3" in content_type or "mpeg" in content_type:
+                    file_extension = ".mp3"
+                elif "flac" in content_type:
+                    file_extension = ".flac"
+
+            cached_file = AUDIO_CACHE_DIR / get_cached_filename(audio_url, file_extension)
+            bytes_downloaded = 0
+            with open(cached_file, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    bytes_downloaded += len(chunk)
+                    if bytes_downloaded > MAX_AUDIO_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"Audio download exceeds the {MAX_AUDIO_DOWNLOAD_BYTES} byte limit"
+                        )
+                    f.write(chunk)
+    except requests.Timeout as exc:
+        if cached_file and cached_file.exists():
+            cached_file.unlink(missing_ok=True)
+        raise ValueError(f"Timed out downloading audio from URL: {audio_url}") from exc
+    except requests.RequestException as exc:
+        if cached_file and cached_file.exists():
+            cached_file.unlink(missing_ok=True)
+        raise ValueError(f"Failed to download audio from URL: {audio_url}") from exc
+    except ValueError:
+        if cached_file and cached_file.exists():
+            cached_file.unlink(missing_ok=True)
+        raise
 
     logger.info(f"Downloaded and cached: {cached_file}")
     return str(cached_file)
