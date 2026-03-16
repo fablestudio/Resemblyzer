@@ -305,10 +305,10 @@ def handle_embeddings_create(input_data: dict) -> dict:
     """
     Generate voice embedding(s) and optionally store in Supabase.
 
-    Input:
-      voice_id: str (optional — if provided, stores in DB)
-      audio_url / audio_base64: audio source (optional if voice_id has preview_url)
-      audio_files: list of {voice_id?, audio_url/audio_base64} for batch
+        Input:
+            voice_id: str (optional — if provided, stores in DB)
+            audio_url / audio_base64 / audio_path: audio source (optional if voice_id has preview_url)
+            audio_files: list of {voice_id?, audio_url/audio_base64/audio_path} for batch
 
     Response (OpenAI-compatible):
       { object: "list", data: [{object: "embedding", index, embedding, voice_id?}],
@@ -325,7 +325,7 @@ def handle_embeddings_create(input_data: dict) -> dict:
         # Resolve audio: explicit audio > preview_url from DB
         audio_path = None
         has_audio = (
-            item.get("audio_url") or item.get("audio_base64")
+            item.get("audio_url") or item.get("audio_base64") or item.get("audio_path")
         )
         if has_audio:
             audio_path = resolve_audio(item, "audio")
@@ -339,7 +339,7 @@ def handle_embeddings_create(input_data: dict) -> dict:
                 )
         else:
             raise ValueError(
-                f"Item {i}: provide audio_url/audio_base64 or a voice_id with a preview_url"
+                f"Item {i}: provide audio_url/audio_base64/audio_path or a voice_id with a preview_url"
             )
 
         embed = generate_embedding(audio_path)
@@ -434,7 +434,7 @@ def handle_audio_identify(input_data: dict) -> dict:
       audio_url / audio_base64: input audio to analyze
       voice_ids: list of voice_id strings — embeddings fetched/generated from DB
       top_k: int (default 5) — max speakers per segment
-      segmentation: "whole" | "auto" | {rate, resolution, ...} | webvtt string | list of segments
+      segmentation: "whole" | "auto" | {rate, resolution, threshold_*, ...} | webvtt string | list of segments
       rate: int (default 4) — partials/sec for auto mode
       resolution: float (default 0.5) — bucket size for auto mode
       threshold_confident: float (default 0.75)
@@ -479,8 +479,11 @@ def handle_audio_identify(input_data: dict) -> dict:
     elif isinstance(segmentation, list):
         return _identify_segmented(input_wav, speaker_embeds, segmentation, top_k, duration)
     else:
-        # "auto" or dict with rate/resolution params
-        return _identify_diarize(input_wav, speaker_embeds, input_data, top_k, duration)
+        diarize_config = input_data
+        if isinstance(segmentation, dict):
+            diarize_config = {**input_data, **segmentation}
+
+        return _identify_diarize(input_wav, speaker_embeds, diarize_config, top_k, duration)
 
 
 def _score_top_k(scores: dict, top_k: int) -> list[dict]:

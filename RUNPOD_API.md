@@ -131,6 +131,7 @@ Speaker identification with per-segment confidence scores. Sends input audio and
 | --- | --- |
 | `"whole"` | Score entire audio as one segment |
 | `"auto"` (default) | Sliding-window diarization with configurable `rate` and `resolution` |
+| JSON object like `{ "rate": 6, "resolution": 0.25 }` | Auto diarization with per-request overrides for diarization parameters |
 | WebVTT string | Parse timestamps and score each cue |
 | JSON array of `{start, end}` | Score each segment independently |
 
@@ -156,6 +157,24 @@ Speaker identification with per-segment confidence scores. Sends input audio and
     "audio_url": "https://example.com/conversation.mp3",
     "voice_ids": ["voice_alice", "voice_bob"],
     "top_k": 3
+  }
+}
+```
+
+#### Example: Auto diarization with inline segmentation config
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/audio/identify",
+    "audio_url": "https://example.com/conversation.mp3",
+    "voice_ids": ["voice_alice", "voice_bob"],
+    "segmentation": {
+      "rate": 6,
+      "resolution": 0.25,
+      "threshold_confident": 0.8,
+      "threshold_uncertain": 0.7
+    }
   }
 }
 ```
