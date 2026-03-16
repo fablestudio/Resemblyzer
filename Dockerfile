@@ -1,9 +1,13 @@
-# RunPod Dockerfile for Resemblyzer Speaker Identification
+# RunPod Dockerfile for Resemblyzer Voice API
 FROM python:3.10-slim
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+
+# Required at runtime (set via RunPod secrets or .env locally):
+#   SUPABASE_URL            — e.g. {{ RUNPOD_SECRET_SUPABASE_URL }}
+#   SUPABASE_SERVICE_KEY    — e.g. {{ RUNPOD_SECRET_SUPABASE_SERVICE_KEY }}
 
 # Install system dependencies (webrtcvad needs build tools, librosa needs ffmpeg/libsndfile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,8 +28,9 @@ RUN pip install --upgrade pip && \
 # Copy the resemblyzer package (includes pretrained.pt model)
 COPY resemblyzer/ /app/resemblyzer/
 
-# Copy the RunPod handler
+# Copy the RunPod handler and Supabase client
 COPY rp_handler.py /app/rp_handler.py
+COPY supabase_client.py /app/supabase_client.py
 
 # Copy test input for local testing
 COPY test_input.json /app/test_input.json

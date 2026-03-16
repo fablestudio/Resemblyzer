@@ -1,7 +1,9 @@
 {
   "input": {
-    "mode": "compare",
-    "audio_a_url": "https://upload.wikimedia.org/wikipedia/commons/2/22/George_W._Bush_Columbia_FINAL.ogg",
-    "audio_b_url": "https://upload.wikimedia.org/wikipedia/commons/2/22/George_W._Bush_Columbia_FINAL.ogg"
+    "endpoint": "/v1/audio/identify",
+    "audio_url": "/app/audio_data/input.mp3",
+    "voice_ids": ["ross", "monica"],
+    "segmentation": "auto",
+    "top_k": 2
   }
 }

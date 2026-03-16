@@ -25,5 +25,8 @@ soundfile
 # --- HTTP & Networking ---
 requests
 
+# --- Supabase ---
+supabase>=2.0.0
+
 # --- RunPod ---
 runpod>=1.7.7

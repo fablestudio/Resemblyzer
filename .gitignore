@@ -126,7 +126,8 @@ core
 
 .vscode
 
-
+.claude
 
 # Project directories
 saved_models
+
