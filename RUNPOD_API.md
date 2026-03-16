@@ -1,4 +1,6 @@
-# Resemblyzer RunPod API
+# Resemblyzer Voice API
+
+OpenAI-compatible voice embedding and speaker identification API running on RunPod serverless.
 
 Endpoint ID: `v8dcvggw1jxkgu`
 
@@ -6,50 +8,225 @@ Base URL: `https://api.runpod.ai/v2/v8dcvggw1jxkgu`
 
 ## Authentication
 
-All requests require a RunPod API key in the `Authorization` header:
+All requests require a RunPod API key:
 
 ```
 Authorization: Bearer <RUNPOD_API_KEY>
 ```
 
-## Modes
+## Environment Variables
 
-### 1. Identify (with automatic diarization)
+The RunPod template requires:
 
-Default when no `segments` are provided. Uses sliding-window embeddings to detect who is speaking when across the entire audio.
+| Variable | Description |
+| --- | --- |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_SERVICE_KEY` | Supabase service role key |
+
+## Endpoints
+
+All requests use RunPod's `/runsync` or `/run` wrapper. The `endpoint` field in `input` routes to the correct handler.
+
+---
+
+### POST /v1/embeddings
+
+Generate voice embedding(s) and store in Supabase.
 
 ```json
 {
   "input": {
-    "mode": "identify",
-    "input_audio_url": "https://example.com/conversation.mp3",
-    "speakers": {
-      "Alice": {
-        "samples": [{ "audio_url": "https://example.com/alice_sample.mp3" }]
-      },
-      "Bob": {
-        "samples": [{ "audio_url": "https://example.com/bob_sample.mp3" }]
-      }
+    "endpoint": "/v1/embeddings",
+    "voice_id": "abc123",
+    "audio_url": "https://example.com/voice_sample.mp3"
+  }
+}
+```
+
+If `audio_url`/`audio_base64` is omitted, the handler looks up the `preview_url` from the `voices` table using the `voice_id`.
+
+**Batch mode:**
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/embeddings",
+    "audio_files": [
+      { "voice_id": "voice_1", "audio_url": "https://example.com/sample1.mp3" },
+      { "voice_id": "voice_2" }
+    ]
+  }
+}
+```
+
+**Response (OpenAI-compatible):**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "index": 0,
+      "embedding": [0.0123, -0.0456, ...],
+      "voice_id": "abc123"
+    }
+  ],
+  "model": "resemblyzer-v1",
+  "usage": { "prompt_tokens": 0, "total_tokens": 0 }
+}
+```
+
+---
+
+### POST /v1/embeddings/get
+
+Retrieve a stored voice embedding by `voice_id`. If no embedding exists but the voice has a `preview_url` in the `voices` table, it auto-generates and stores the embedding.
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/embeddings/get",
+    "voice_id": "abc123"
+  }
+}
+```
+
+**Response:** Same OpenAI-compatible format as `/v1/embeddings`.
+
+---
+
+### POST /v1/embeddings/delete
+
+Delete a stored voice embedding.
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/embeddings/delete",
+    "voice_id": "abc123"
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "deleted": true,
+  "voice_id": "abc123",
+  "object": "embedding.deleted"
+}
+```
+
+---
+
+### POST /v1/audio/identify
+
+Speaker identification with per-segment confidence scores. Sends input audio and a list of `voice_ids` to compare against. Embeddings are automatically fetched from Supabase (or generated from `preview_url` if missing).
+
+#### Segmentation modes
+
+| `segmentation` value | Behavior |
+| --- | --- |
+| `"whole"` | Score entire audio as one segment |
+| `"auto"` (default) | Sliding-window diarization with configurable `rate` and `resolution` |
+| JSON object like `{ "rate": 6, "resolution": 0.25 }` | Auto diarization with per-request overrides for diarization parameters |
+| WebVTT string | Parse timestamps and score each cue |
+| JSON array of `{start, end}` | Score each segment independently |
+
+#### Parameters
+
+| Param | Default | Description |
+| --- | --- | --- |
+| `audio_url` / `audio_base64` | — | Input audio to analyze (required) |
+| `voice_ids` | — | List of voice_id strings (required) |
+| `top_k` | `5` | Max speakers returned per segment |
+| `segmentation` | `"auto"` | Segmentation mode (see above) |
+| `rate` | `4` | Partial utterances per second (auto mode) |
+| `resolution` | `0.5` | Bucket size in seconds (auto mode) |
+| `threshold_confident` | `0.75` | Score threshold for "high" confidence |
+| `threshold_uncertain` | `0.65` | Score threshold for "medium" confidence |
+
+#### Example: Auto diarization
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/audio/identify",
+    "audio_url": "https://example.com/conversation.mp3",
+    "voice_ids": ["voice_alice", "voice_bob"],
+    "top_k": 3
+  }
+}
+```
+
+#### Example: Auto diarization with inline segmentation config
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/audio/identify",
+    "audio_url": "https://example.com/conversation.mp3",
+    "voice_ids": ["voice_alice", "voice_bob"],
+    "segmentation": {
+      "rate": 6,
+      "resolution": 0.25,
+      "threshold_confident": 0.8,
+      "threshold_uncertain": 0.7
     }
   }
 }
 ```
 
-Optional diarization parameters:
-
-| Param                 | Default | Description                                                       |
-| --------------------- | ------- | ----------------------------------------------------------------- |
-| `rate`                | `4`     | Partial utterances per second (higher = finer resolution, slower) |
-| `resolution`          | `0.5`   | Bucket size in seconds for speaker assignment                     |
-| `threshold_confident` | `0.75`  | Minimum score for "confident" label                               |
-| `threshold_uncertain` | `0.65`  | Minimum score for "uncertain" label (below = "none")              |
-
-Response:
+#### Example: Whole file
 
 ```json
 {
-  "status": "success",
-  "mode": "diarize",
+  "input": {
+    "endpoint": "/v1/audio/identify",
+    "audio_url": "https://example.com/clip.mp3",
+    "voice_ids": ["voice_alice", "voice_bob"],
+    "segmentation": "whole"
+  }
+}
+```
+
+#### Example: WebVTT segments
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/audio/identify",
+    "audio_url": "https://example.com/conversation.mp3",
+    "voice_ids": ["voice_alice", "voice_bob"],
+    "segmentation": "WEBVTT\n\n1\n00:00:01.019 --> 00:00:02.899\n<v Alice>Hey!\n\n2\n00:00:03.439 --> 00:00:05.419\n<v Bob>Hi there!\n"
+  }
+}
+```
+
+#### Example: Manual segments
+
+```json
+{
+  "input": {
+    "endpoint": "/v1/audio/identify",
+    "audio_url": "https://example.com/conversation.mp3",
+    "voice_ids": ["voice_alice", "voice_bob"],
+    "segmentation": [
+      { "start": 1.019, "end": 2.899, "text": "Hey!" },
+      { "start": 3.439, "end": 5.419, "text": "Hi there!" }
+    ]
+  }
+}
+```
+
+#### Response
+
+```json
+{
+  "object": "speaker_identification",
+  "model": "resemblyzer-v1",
   "duration": 51.84,
   "num_segments": 12,
   "segments": [
@@ -57,378 +234,61 @@ Response:
       "start": 4.0,
       "end": 6.0,
       "duration": 2.0,
-      "speaker": "Alice",
-      "score": 0.8427,
-      "confidence": "confident",
-      "scores": { "Alice": 0.8427, "Bob": 0.5472 }
+      "speaker": "voice_alice",
+      "confidence": "high",
+      "top_speakers": [
+        { "voice_id": "voice_alice", "score": 0.8427 },
+        { "voice_id": "voice_bob", "score": 0.5472 }
+      ],
+      "scores": { "voice_alice": 0.8427, "voice_bob": 0.5472 }
     }
   ],
   "speaker_summary": {
-    "Alice": { "min": 0.37, "max": 0.93, "mean": 0.59 },
-    "Bob": { "min": 0.37, "max": 0.97, "mean": 0.55 }
+    "voice_alice": { "min": 0.37, "max": 0.93, "mean": 0.59 },
+    "voice_bob": { "min": 0.37, "max": 0.97, "mean": 0.55 }
   }
 }
 ```
 
-### 2. Identify (with WebVTT segments)
+Confidence levels:
+- `"high"` — score > `threshold_confident` (default 0.75)
+- `"medium"` — score > `threshold_uncertain` (default 0.65)
+- `"low"` — score below both thresholds
 
-When `segments` is provided, each subtitle cue is sliced from the audio and scored independently. Useful for verifying speaker labels in an existing transcript.
+---
 
-```json
-{
-  "input": {
-    "mode": "identify",
-    "input_audio_url": "https://example.com/conversation.mp3",
-    "speakers": {
-      "Alice": {
-        "samples": [{ "audio_url": "https://example.com/alice_sample.mp3" }]
-      },
-      "Bob": {
-        "samples": [{ "audio_url": "https://example.com/bob_sample.mp3" }]
-      }
-    },
-    "segments": "WEBVTT\n\n1\n00:00:01.019 --> 00:00:02.899\n<v Alice>Hey, how are you?\n\n2\n00:00:03.439 --> 00:00:05.419\n<v Bob>I'm good, thanks!\n"
-  }
-}
-```
+## Error format
 
-Segments can also be passed as a JSON array:
-
-```json
-"segments": [
-  { "start": 1.019, "end": 2.899, "speaker": "Alice", "text": "Hey, how are you?" },
-  { "start": 3.439, "end": 5.419, "speaker": "Bob", "text": "I'm good, thanks!" }
-]
-```
-
-Response:
+Errors follow the OpenAI error convention:
 
 ```json
 {
-  "status": "success",
-  "mode": "segmented",
-  "num_segments": 2,
-  "segments": [
-    {
-      "index": 1,
-      "start": 1.019,
-      "end": 2.899,
-      "text": "Hey, how are you?",
-      "speaker": "Alice",
-      "scores": { "Alice": 0.82, "Bob": 0.55 },
-      "best_match": "Alice",
-      "best_score": 0.82
-    }
-  ]
-}
-```
-
-### 3. Compare
-
-Direct similarity between two audio files.
-
-```json
-{
-  "input": {
-    "mode": "compare",
-    "audio_a_url": "https://example.com/clip1.mp3",
-    "audio_b_url": "https://example.com/clip2.mp3"
-  }
-}
-```
-
-Response: `{ "status": "success", "similarity": 0.7857 }`
-
-### 4. Embed
-
-Generate raw 256-dimensional voice embeddings.
-
-```json
-{
-  "input": {
-    "mode": "embed",
-    "audio_url": "https://example.com/clip.mp3"
-  }
-}
-```
-
-For multiple files:
-
-```json
-{
-  "input": {
-    "mode": "embed",
-    "audio_files": [
-      { "audio_url": "https://example.com/clip1.mp3" },
-      { "audio_url": "https://example.com/clip2.mp3" }
-    ]
+  "error": {
+    "message": "voice_id 'xyz' has no stored embedding and no preview_url.",
+    "type": "invalid_request_error"
   }
 }
 ```
 
 ## Audio input formats
 
-All audio parameters accept either a URL or base64-encoded data:
+All audio parameters accept either a URL or base64:
 
-- `*_url` — the endpoint downloads and caches the file
+- `*_url` — downloads and caches the file
 - `*_base64` — raw audio bytes encoded as base64
 
 Supported formats: `.wav`, `.mp3`, `.m4a`, `.flac`
 
-## Next.js API Route (Vercel)
+## Database setup
 
-### Environment variable
+Run the migration in `migrations/001_create_voice_embeddings.sql` in your Supabase SQL editor. This creates:
 
-Add to `.env.local` (and Vercel project settings):
+- `voice_embeddings` table (voice_id, 256-dim vector embedding)
+- `match_voice_embeddings()` function for similarity search
+- RLS policy for service role access
 
-```
-RUNPOD_API_KEY=rpa_xxxxx
-```
-
-### Shared client — `lib/runpod.ts`
-
-```ts
-const RUNPOD_API_KEY = process.env.RUNPOD_API_KEY!;
-const ENDPOINT_ID = "v8dcvggw1jxkgu";
-const BASE_URL = `https://api.runpod.ai/v2/${ENDPOINT_ID}`;
-
-export interface RunPodResponse<T = unknown> {
-  id: string;
-  status: "IN_QUEUE" | "IN_PROGRESS" | "COMPLETED" | "FAILED" | "TIMED_OUT";
-  output?: T;
-  delayTime?: number;
-  executionTime?: number;
-}
-
-export async function runpodRequest<T = unknown>(
-  input: Record<string, unknown>,
-): Promise<RunPodResponse<T>> {
-  // Try synchronous first (30s timeout on RunPod side)
-  const res = await fetch(`${BASE_URL}/runsync`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${RUNPOD_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ input }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`RunPod request failed: ${res.status} ${await res.text()}`);
-  }
-
-  const data: RunPodResponse<T> = await res.json();
-
-  // If still processing, poll for result
-  if (data.status === "IN_QUEUE" || data.status === "IN_PROGRESS") {
-    return pollForResult<T>(data.id);
-  }
-
-  return data;
-}
-
-async function pollForResult<T>(
-  jobId: string,
-  maxAttempts = 60,
-  intervalMs = 2000,
-): Promise<RunPodResponse<T>> {
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((r) => setTimeout(r, intervalMs));
-
-    const res = await fetch(`${BASE_URL}/status/${jobId}`, {
-      headers: { Authorization: `Bearer ${RUNPOD_API_KEY}` },
-    });
-    const data: RunPodResponse<T> = await res.json();
-
-    if (
-      data.status === "COMPLETED" ||
-      data.status === "FAILED" ||
-      data.status === "TIMED_OUT"
-    ) {
-      return data;
-    }
-  }
-
-  throw new Error(`RunPod job ${jobId} timed out after polling`);
-}
-```
-
-### Diarize endpoint — `app/api/resemblyzer/diarize/route.ts`
-
-Automatic speaker diarization (no segments needed).
-
-```ts
-import { NextRequest, NextResponse } from "next/server";
-import { runpodRequest } from "@/lib/runpod";
-
-interface DiarizeSegment {
-  start: number;
-  end: number;
-  duration: number;
-  speaker: string | null;
-  score: number;
-  confidence: "confident" | "uncertain" | "none";
-  scores: Record<string, number>;
-}
-
-interface DiarizeOutput {
-  status: string;
-  mode: string;
-  duration: number;
-  num_segments: number;
-  segments: DiarizeSegment[];
-  speaker_summary: Record<string, { min: number; max: number; mean: number }>;
-}
-
-export async function POST(req: NextRequest) {
-  const body = await req.json();
-  const { inputAudioUrl, speakers } = body;
-
-  // speakers: { "Alice": { sampleUrls: ["https://..."] }, ... }
-  const speakersPayload: Record<string, { samples: { audio_url: string }[] }> =
-    {};
-  for (const [name, data] of Object.entries(speakers) as [
-    string,
-    { sampleUrls: string[] },
-  ][]) {
-    speakersPayload[name] = {
-      samples: data.sampleUrls.map((url) => ({ audio_url: url })),
-    };
-  }
-
-  const result = await runpodRequest<DiarizeOutput>({
-    mode: "identify",
-    input_audio_url: inputAudioUrl,
-    speakers: speakersPayload,
-  });
-
-  if (result.status === "FAILED") {
-    return NextResponse.json({ error: "Diarization failed" }, { status: 500 });
-  }
-
-  return NextResponse.json(result.output);
-}
-```
-
-### Segment scoring endpoint — `app/api/resemblyzer/score-segments/route.ts`
-
-Score an existing WebVTT transcript against speaker samples.
-
-```ts
-import { NextRequest, NextResponse } from "next/server";
-import { runpodRequest } from "@/lib/runpod";
-
-interface SegmentResult {
-  index: number;
-  start: number;
-  end: number;
-  text: string;
-  speaker: string | null;
-  scores: Record<string, number>;
-  best_match: string;
-  best_score: number;
-}
-
-interface SegmentedOutput {
-  status: string;
-  mode: string;
-  num_segments: number;
-  segments: SegmentResult[];
-}
-
-export async function POST(req: NextRequest) {
-  const body = await req.json();
-  const { inputAudioUrl, speakers, webvtt } = body;
-
-  const speakersPayload: Record<string, { samples: { audio_url: string }[] }> =
-    {};
-  for (const [name, data] of Object.entries(speakers) as [
-    string,
-    { sampleUrls: string[] },
-  ][]) {
-    speakersPayload[name] = {
-      samples: data.sampleUrls.map((url) => ({ audio_url: url })),
-    };
-  }
-
-  const result = await runpodRequest<SegmentedOutput>({
-    mode: "identify",
-    input_audio_url: inputAudioUrl,
-    speakers: speakersPayload,
-    segments: webvtt,
-  });
-
-  if (result.status === "FAILED") {
-    return NextResponse.json(
-      { error: "Segment scoring failed" },
-      { status: 500 },
-    );
-  }
-
-  return NextResponse.json(result.output);
-}
-```
-
-### Compare endpoint — `app/api/resemblyzer/compare/route.ts`
-
-```ts
-import { NextRequest, NextResponse } from "next/server";
-import { runpodRequest } from "@/lib/runpod";
-
-export async function POST(req: NextRequest) {
-  const { audioUrlA, audioUrlB } = await req.json();
-
-  const result = await runpodRequest<{ status: string; similarity: number }>({
-    mode: "compare",
-    audio_a_url: audioUrlA,
-    audio_b_url: audioUrlB,
-  });
-
-  if (result.status === "FAILED") {
-    return NextResponse.json({ error: "Comparison failed" }, { status: 500 });
-  }
-
-  return NextResponse.json(result.output);
-}
-```
-
-### Client-side usage example
-
-```ts
-// Diarize a conversation
-const res = await fetch("/api/resemblyzer/diarize", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    inputAudioUrl: "https://storage.example.com/conversation.mp3",
-    speakers: {
-      "Ross Geller": { sampleUrls: ["https://storage.example.com/ross.mp3"] },
-      "Rachel Green": {
-        sampleUrls: ["https://storage.example.com/rachel.mp3"],
-      },
-    },
-  }),
-});
-const data = await res.json();
-// data.segments => [{ start: 4.0, end: 6.0, speaker: "Rachel Green", score: 0.84, ... }]
-
-// Score a WebVTT transcript
-const res2 = await fetch("/api/resemblyzer/score-segments", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    inputAudioUrl: "https://storage.example.com/conversation.mp3",
-    speakers: {
-      "Ross Geller": { sampleUrls: ["https://storage.example.com/ross.mp3"] },
-      "Rachel Green": {
-        sampleUrls: ["https://storage.example.com/rachel.mp3"],
-      },
-    },
-    webvtt: `WEBVTT\n\n1\n00:00:01.019 --> 00:00:02.899\n<v Rachel Green>Hey!\n`,
-  }),
-});
-```
+The handler references the existing `voices` table (from `fable-simulation-webapp`) to look up `preview_url` for auto-generating embeddings.
 
 ## Cold start
 
-First request after idle may take ~2 minutes (worker spin-up + model load). Subsequent requests complete in 5-20 seconds depending on audio length. The model loads in ~0.02s once the container is running.
+First request after idle takes ~2 minutes (worker spin-up + model load). Subsequent requests complete in 5-20 seconds depending on audio length.

@@ -1,27 +1,50 @@
+"""
+RunPod serverless handler for Resemblyzer — OpenAI-compatible voice API.
+
+Endpoints (routed via "endpoint" field in input):
+
+  POST /v1/embeddings          — Generate and store voice embeddings
+  POST /v1/embeddings/get      — Retrieve stored voice embedding by voice_id
+  POST /v1/embeddings/delete   — Delete a stored voice embedding
+  POST /v1/audio/identify      — Speaker identification with confidence scores
+"""
+
 import runpod
 import logging
 import hashlib
 import os
 import re
 import base64
-import tempfile
-import requests
 import numpy as np
 from pathlib import Path
 
 from resemblyzer import VoiceEncoder, preprocess_wav
 from resemblyzer.hparams import sampling_rate
+import supabase_client as db
 
-# Set up logging
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Global model instance
+# ---------------------------------------------------------------------------
+# Global model
+# ---------------------------------------------------------------------------
 encoder = None
 
+MODEL_ID = "resemblyzer-v1"
+EMBEDDING_DIM = 256
 AUDIO_CACHE_DIR = Path("/app/audio_cache")
+DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 5
+DOWNLOAD_READ_TIMEOUT_SECONDS = 60
+MAX_AUDIO_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Audio helpers (unchanged core logic)
+# ---------------------------------------------------------------------------
 
 
 def get_audio_cache_hash(url: str) -> str:
@@ -36,45 +59,78 @@ def get_cached_filename(url: str, ext: str) -> str:
 
 
 def download_cached_audio(audio_url: str) -> str:
-    """Download audio file from URL with caching support."""
-    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    import requests
 
-    # Check cache
+    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cached_file = None
+
     for ext in [".wav", ".mp3", ".m4a", ".flac"]:
         cached_file = AUDIO_CACHE_DIR / get_cached_filename(audio_url, ext)
         if cached_file.exists():
             logger.info(f"Cache hit: {cached_file}")
             return str(cached_file)
 
-    logger.info(f"Downloading audio from URL...")
-    response = requests.get(audio_url, stream=True)
-    response.raise_for_status()
+    logger.info("Downloading audio from URL...")
+    try:
+        with requests.get(
+            audio_url,
+            stream=True,
+            timeout=(
+                DOWNLOAD_CONNECT_TIMEOUT_SECONDS,
+                DOWNLOAD_READ_TIMEOUT_SECONDS,
+            ),
+        ) as response:
+            response.raise_for_status()
 
-    # Detect extension
-    file_extension = ".wav"
-    url_lower = audio_url.lower()
-    for ext in [".mp3", ".wav", ".m4a", ".flac"]:
-        if url_lower.endswith(ext):
-            file_extension = ext
-            break
-    else:
-        content_type = response.headers.get("content-type", "").lower()
-        if "mp3" in content_type or "mpeg" in content_type:
-            file_extension = ".mp3"
-        elif "flac" in content_type:
-            file_extension = ".flac"
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > MAX_AUDIO_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"Audio download exceeds the {MAX_AUDIO_DOWNLOAD_BYTES} byte limit"
+                )
 
-    cached_file = AUDIO_CACHE_DIR / get_cached_filename(audio_url, file_extension)
-    with open(cached_file, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+            file_extension = ".wav"
+            url_lower = audio_url.lower()
+            for ext in [".mp3", ".wav", ".m4a", ".flac"]:
+                if url_lower.endswith(ext):
+                    file_extension = ext
+                    break
+            else:
+                content_type = response.headers.get("content-type", "").lower()
+                if "mp3" in content_type or "mpeg" in content_type:
+                    file_extension = ".mp3"
+                elif "flac" in content_type:
+                    file_extension = ".flac"
+
+            cached_file = AUDIO_CACHE_DIR / get_cached_filename(audio_url, file_extension)
+            bytes_downloaded = 0
+            with open(cached_file, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    bytes_downloaded += len(chunk)
+                    if bytes_downloaded > MAX_AUDIO_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"Audio download exceeds the {MAX_AUDIO_DOWNLOAD_BYTES} byte limit"
+                        )
+                    f.write(chunk)
+    except requests.Timeout as exc:
+        if cached_file and cached_file.exists():
+            cached_file.unlink(missing_ok=True)
+        raise ValueError(f"Timed out downloading audio from URL: {audio_url}") from exc
+    except requests.RequestException as exc:
+        if cached_file and cached_file.exists():
+            cached_file.unlink(missing_ok=True)
+        raise ValueError(f"Failed to download audio from URL: {audio_url}") from exc
+    except ValueError:
+        if cached_file and cached_file.exists():
+            cached_file.unlink(missing_ok=True)
+        raise
 
     logger.info(f"Downloaded and cached: {cached_file}")
     return str(cached_file)
 
 
 def decode_base64_audio(audio_base64: str, filename: str = "input.wav") -> str:
-    """Decode base64 audio data to a temporary file."""
     tmp_dir = Path("/tmp/resemblyzer_audio")
     tmp_dir.mkdir(parents=True, exist_ok=True)
     tmp_path = tmp_dir / filename
@@ -84,25 +140,59 @@ def decode_base64_audio(audio_base64: str, filename: str = "input.wav") -> str:
     return str(tmp_path)
 
 
-def resolve_audio(audio_spec: dict, key_prefix: str = "audio") -> str:
-    """
-    Resolve an audio source from either a URL or base64 data.
-    Looks for keys: {key_prefix}_url or {key_prefix}_base64
-    Returns path to the audio file.
-    """
+def resolve_audio(spec: dict, key_prefix: str = "audio") -> str:
+    """Resolve audio from {prefix}_url, {prefix}_base64, or {prefix}_path keys."""
     url_key = f"{key_prefix}_url"
     b64_key = f"{key_prefix}_base64"
+    path_key = f"{key_prefix}_path"
 
-    if url_key in audio_spec and audio_spec[url_key]:
-        return download_cached_audio(audio_spec[url_key])
-    elif b64_key in audio_spec and audio_spec[b64_key]:
-        return decode_base64_audio(audio_spec[b64_key], f"{key_prefix}.wav")
+    if path_key in spec and spec[path_key]:
+        p = spec[path_key]
+        if not Path(p).exists():
+            raise ValueError(f"Local file not found: {p}")
+        return p
+    elif url_key in spec and spec[url_key]:
+        url = spec[url_key]
+        # Delegate URL (or local path) resolution to the shared helper so that
+        # Docker localhost rewriting is consistently applied.
+        return resolve_audio_url(url)
+    elif b64_key in spec and spec[b64_key]:
+        return decode_base64_audio(spec[b64_key], f"{key_prefix}.wav")
     else:
-        raise ValueError(f"No audio source provided. Expected '{url_key}' or '{b64_key}'.")
+        raise ValueError(f"No audio source provided. Expected '{url_key}', '{b64_key}', or '{path_key}'.")
+
+
+def rewrite_url_for_docker(url: str) -> str:
+    """Rewrite localhost/127.0.0.1 URLs to use host.docker.internal when running in Docker."""
+    import re as _re
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    if "host.docker.internal" in supabase_url:
+        # Extract the host:port from SUPABASE_URL to use as replacement
+        from urllib.parse import urlparse
+        parsed = urlparse(supabase_url)
+        docker_host = f"{parsed.scheme}://{parsed.netloc}"
+        # Replace localhost variants in the URL
+        url = _re.sub(r"https?://(localhost|127\.0\.0\.1)(:\d+)?", docker_host, url)
+    return url
+
+
+def resolve_audio_url(url: str) -> str:
+    """Resolve an audio URL (or local path) and return local file path."""
+    if url.startswith("/") or url.startswith("file://"):
+        local_path = url.replace("file://", "")
+        if not Path(local_path).exists():
+            raise ValueError(f"Local file not found: {local_path}")
+        return local_path
+    url = rewrite_url_for_docker(url)
+    return download_cached_audio(url)
+
+
+# ---------------------------------------------------------------------------
+# WebVTT parsing
+# ---------------------------------------------------------------------------
 
 
 def parse_webvtt_timestamp(ts: str) -> float:
-    """Parse a WebVTT timestamp (HH:MM:SS.mmm) to seconds."""
     parts = ts.strip().split(":")
     if len(parts) == 3:
         h, m, s = parts
@@ -114,28 +204,16 @@ def parse_webvtt_timestamp(ts: str) -> float:
 
 
 def parse_webvtt(webvtt: str) -> list:
-    """
-    Parse WebVTT content into a list of segment dicts.
-
-    Supports optional <v SpeakerName> voice tags in cue text.
-
-    Returns list of:
-      {"index": int, "start": float, "end": float, "text": str, "speaker": str|None}
-    """
     segments = []
-    # Split into cue blocks (separated by blank lines)
     blocks = re.split(r"\n\s*\n", webvtt.strip())
 
     for block in blocks:
         lines = block.strip().split("\n")
         if not lines:
             continue
-
-        # Skip the WEBVTT header
         if lines[0].startswith("WEBVTT"):
             continue
 
-        # Find the timestamp line
         ts_line = None
         ts_idx = None
         for i, line in enumerate(lines):
@@ -143,27 +221,22 @@ def parse_webvtt(webvtt: str) -> list:
                 ts_line = line
                 ts_idx = i
                 break
-
         if ts_line is None:
             continue
 
-        # Parse timestamps
         match = re.match(r"([\d:.]+)\s*-->\s*([\d:.]+)", ts_line)
         if not match:
             continue
         start = parse_webvtt_timestamp(match.group(1))
         end = parse_webvtt_timestamp(match.group(2))
 
-        # Parse cue index (line before timestamp, if numeric)
         cue_index = None
         if ts_idx > 0 and lines[ts_idx - 1].strip().isdigit():
             cue_index = int(lines[ts_idx - 1].strip())
 
-        # Remaining lines are the cue text
         text_lines = lines[ts_idx + 1:]
         text = " ".join(text_lines).strip()
 
-        # Extract <v SpeakerName> voice tag if present
         speaker = None
         voice_match = re.match(r"<v\s+([^>]+)>(.*)$", text)
         if voice_match:
@@ -182,229 +255,342 @@ def parse_webvtt(webvtt: str) -> list:
 
 
 def slice_wav_segment(wav: np.ndarray, start: float, end: float) -> np.ndarray:
-    """Slice a waveform array by start/end seconds."""
-    start_sample = int(start * sampling_rate)
-    end_sample = int(end * sampling_rate)
-    start_sample = max(0, start_sample)
-    end_sample = min(len(wav), end_sample)
+    start_sample = max(0, int(start * sampling_rate))
+    end_sample = min(len(wav), int(end * sampling_rate))
     return wav[start_sample:end_sample]
 
 
-def handler(event):
+# ---------------------------------------------------------------------------
+# Embedding generation helper
+# ---------------------------------------------------------------------------
+
+
+def generate_embedding(audio_path: str) -> np.ndarray:
+    """Generate a 256-dim voice embedding from an audio file path."""
+    wav = preprocess_wav(audio_path)
+    return encoder.embed_utterance(wav)
+
+
+def resolve_voice_embedding(voice_id: str) -> np.ndarray:
     """
-    RunPod serverless handler for Resemblyzer speaker identification.
-
-    Supports three modes:
-
-    1. "identify" - Compare input audio against named speaker samples.
-
-       Without "segments": automatic continuous diarization using sliding-window
-       embeddings (default). Detects who is speaking when by computing partial
-       embeddings across the audio and merging adjacent windows with the same
-       best-matching speaker. Optional params: rate (default 4), resolution
-       (default 0.5), threshold_confident (default 0.75), threshold_uncertain
-       (default 0.65).
-
-       With "segments" (WebVTT string or list of {start, end} dicts): scores
-       each segment independently against all speakers.
-
-       Input:
-       {
-         "mode": "identify",
-         "input_audio_url": "https://...",        # OR "input_audio_base64": "<base64>"
-         "speakers": {
-           "speaker_name": {
-             "samples": [
-               {"audio_url": "https://..."},      # OR {"audio_base64": "<base64>"}
-             ]
-           }
-         },
-         // Optional - omit for auto-diarization:
-         "segments": "WEBVTT\n\n1\n00:00:01.019 --> 00:00:02.899\n<v Rachel>Hey!\n\n..."
-         // OR "segments": [{"start": 1.019, "end": 2.899, "speaker": "Rachel", "text": "Hey!"}]
-       }
-
-    2. "embed" - Generate voice embedding(s) for audio file(s)
-       Input:
-       {
-         "mode": "embed",
-         "audio_url": "https://...",              # OR "audio_base64": "<base64>"
-         # OR for multiple files:
-         "audio_files": [
-           {"audio_url": "https://..."},
-           {"audio_base64": "<base64>"}
-         ]
-       }
-
-    3. "compare" - Compare two audio files directly
-       Input:
-       {
-         "mode": "compare",
-         "audio_a_url": "https://...",            # OR "audio_a_base64": "<base64>"
-         "audio_b_url": "https://...",            # OR "audio_b_base64": "<base64>"
-       }
+    Get embedding for a voice_id:
+      1. Check Supabase voice_embeddings table
+      2. If missing, look up preview_url from voices table, generate, and store
+      3. If no preview_url, raise an error
     """
-    global encoder
+    stored = db.get_voice_embedding(voice_id)
+    if stored is not None:
+        return np.array(stored, dtype=np.float32)
 
-    input_data = event["input"]
-    mode = input_data.get("mode", "identify")
+    preview_url = db.get_voice_preview_url(voice_id)
+    if not preview_url:
+        raise ValueError(
+            f"voice_id '{voice_id}' has no stored embedding and no preview_url. "
+            f"Provide a reference audio URL or create an embedding first."
+        )
 
-    logger.info(f"Processing request, mode: {mode}")
+    logger.info(f"Generating embedding for voice_id={voice_id} from preview_url")
+    audio_path = resolve_audio_url(preview_url)
+    embed = generate_embedding(audio_path)
+    db.store_voice_embedding(voice_id, embed.tolist())
+    return embed
 
-    try:
-        if mode == "identify":
-            return handle_identify(input_data)
-        elif mode == "embed":
-            return handle_embed(input_data)
-        elif mode == "compare":
-            return handle_compare(input_data)
+
+# ---------------------------------------------------------------------------
+# Endpoint: POST /v1/embeddings
+# ---------------------------------------------------------------------------
+
+
+def handle_embeddings_create(input_data: dict) -> dict:
+    """
+    Generate voice embedding(s) and optionally store in Supabase.
+
+        Input:
+            voice_id: str (optional — if provided, stores in DB)
+            audio_url / audio_base64 / audio_path: audio source (optional if voice_id has preview_url)
+            audio_files: list of {voice_id?, audio_url/audio_base64/audio_path} for batch
+
+    Response (OpenAI-compatible):
+      { object: "list", data: [{object: "embedding", index, embedding, voice_id?}],
+        model, usage }
+    """
+    audio_files = input_data.get("audio_files", [])
+    if not audio_files:
+        audio_files = [input_data]
+
+    results = []
+    for i, item in enumerate(audio_files):
+        voice_id = item.get("voice_id")
+
+        # Resolve audio: explicit audio > preview_url from DB
+        audio_path = None
+        has_audio = (
+            item.get("audio_url") or item.get("audio_base64") or item.get("audio_path")
+        )
+        if has_audio:
+            audio_path = resolve_audio(item, "audio")
+        elif voice_id:
+            preview_url = db.get_voice_preview_url(voice_id)
+            if preview_url:
+                audio_path = resolve_audio_url(preview_url)
+            else:
+                raise ValueError(
+                    f"No audio provided and voice_id '{voice_id}' has no preview_url"
+                )
         else:
-            return {"status": "error", "message": f"Unknown mode: {mode}. Use 'identify', 'embed', or 'compare'."}
+            raise ValueError(
+                f"Item {i}: provide audio_url/audio_base64/audio_path or a voice_id with a preview_url"
+            )
 
-    except Exception as e:
-        logger.error(f"Error processing request: {e}", exc_info=True)
-        return {"status": "error", "message": str(e)}
+        embed = generate_embedding(audio_path)
+
+        if voice_id:
+            db.store_voice_embedding(voice_id, embed.tolist())
+
+        results.append({
+            "object": "embedding",
+            "index": i,
+            "embedding": embed.tolist(),
+            "voice_id": voice_id,
+        })
+
+    return {
+        "object": "list",
+        "data": results,
+        "model": MODEL_ID,
+        "usage": {"prompt_tokens": 0, "total_tokens": 0},
+    }
 
 
-def handle_identify(input_data: dict) -> dict:
+# ---------------------------------------------------------------------------
+# Endpoint: POST /v1/embeddings/get
+# ---------------------------------------------------------------------------
+
+
+def handle_embeddings_get(input_data: dict) -> dict:
     """
-    Compare input audio against named speaker samples.
+    Retrieve a stored voice embedding. Auto-generates from preview_url if missing.
 
-    Three sub-modes determined by the presence of "segments":
-      - segments provided (WebVTT or list): score each cue segment independently
-      - no segments: automatic continuous diarization using sliding-window embeddings
+    Input:
+      voice_id: str (required)
+
+    Response (OpenAI-compatible):
+      { object: "list", data: [{object: "embedding", index, embedding, voice_id}],
+        model, usage }
     """
-    global encoder
+    voice_id = input_data.get("voice_id")
+    if not voice_id:
+        raise ValueError("voice_id is required")
 
+    embed = resolve_voice_embedding(voice_id)
+
+    return {
+        "object": "list",
+        "data": [{
+            "object": "embedding",
+            "index": 0,
+            "embedding": embed.tolist(),
+            "voice_id": voice_id,
+        }],
+        "model": MODEL_ID,
+        "usage": {"prompt_tokens": 0, "total_tokens": 0},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: POST /v1/embeddings/delete
+# ---------------------------------------------------------------------------
+
+
+def handle_embeddings_delete(input_data: dict) -> dict:
+    """
+    Delete a stored voice embedding.
+
+    Input:
+      voice_id: str (required)
+    """
+    voice_id = input_data.get("voice_id")
+    if not voice_id:
+        raise ValueError("voice_id is required")
+
+    deleted = db.delete_voice_embedding(voice_id)
+    return {
+        "deleted": deleted,
+        "voice_id": voice_id,
+        "object": "embedding.deleted",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: POST /v1/audio/identify
+# ---------------------------------------------------------------------------
+
+
+def handle_audio_identify(input_data: dict) -> dict:
+    """
+    Speaker identification with per-segment confidence scores.
+
+    Input:
+      audio_url / audio_base64: input audio to analyze
+      voice_ids: list of voice_id strings — embeddings fetched/generated from DB
+      top_k: int (default 5) — max speakers per segment
+      segmentation: "whole" | "auto" | {rate, resolution, threshold_*, ...} | webvtt string | list of segments
+      rate: int (default 4) — partials/sec for auto mode
+      resolution: float (default 0.5) — bucket size for auto mode
+      threshold_confident: float (default 0.75)
+      threshold_uncertain: float (default 0.65)
+
+    Response:
+      { segments: [...], speakers: {...}, duration, model }
+    """
     # Resolve input audio
-    input_path = resolve_audio(input_data, "input_audio")
+    input_path = resolve_audio(input_data, "audio")
     input_wav = preprocess_wav(input_path)
+    duration = len(input_wav) / sampling_rate
 
-    # Build speaker embeddings
-    speakers = input_data.get("speakers", {})
-    if not speakers:
-        return {"status": "error", "message": "No speakers provided."}
+    # Resolve speaker embeddings from voice_ids
+    voice_ids = input_data.get("voice_ids", [])
+    if not voice_ids:
+        raise ValueError("voice_ids is required and must be a non-empty list")
+
+    top_k = input_data.get("top_k", 5)
 
     speaker_embeds = {}
-    for speaker_name, speaker_data in speakers.items():
-        samples = speaker_data.get("samples", [])
-        if not samples:
-            logger.warning(f"No samples for speaker: {speaker_name}")
-            continue
-        sample_wavs = []
-        for sample in samples:
-            sample_path = resolve_audio(sample, "audio")
-            sample_wav = preprocess_wav(sample_path)
-            sample_wavs.append(sample_wav)
-        speaker_embeds[speaker_name] = encoder.embed_speaker(sample_wavs)
+    errors = []
+    for vid in voice_ids:
+        try:
+            speaker_embeds[vid] = resolve_voice_embedding(vid)
+        except ValueError as e:
+            errors.append(str(e))
 
-    # Parse segments if provided
-    raw_segments = input_data.get("segments")
-    segments = None
-    if raw_segments:
-        if isinstance(raw_segments, str):
-            segments = parse_webvtt(raw_segments)
-        elif isinstance(raw_segments, list):
-            segments = raw_segments
+    if errors:
+        raise ValueError(
+            f"Failed to resolve {len(errors)} voice(s): " + "; ".join(errors)
+        )
 
-    if segments:
-        return _identify_segmented(input_wav, speaker_embeds, segments)
+    # Determine segmentation mode
+    segmentation = input_data.get("segmentation", "auto")
+
+    if segmentation == "whole":
+        return _identify_whole(input_wav, speaker_embeds, top_k, duration)
+    elif isinstance(segmentation, str) and segmentation.strip().startswith("WEBVTT"):
+        segments = parse_webvtt(segmentation)
+        return _identify_segmented(input_wav, speaker_embeds, segments, top_k, duration)
+    elif isinstance(segmentation, list):
+        return _identify_segmented(input_wav, speaker_embeds, segmentation, top_k, duration)
     else:
-        return _identify_diarize(input_wav, speaker_embeds, input_data)
+        diarize_config = input_data
+        if isinstance(segmentation, dict):
+            diarize_config = {**input_data, **segmentation}
+
+        return _identify_diarize(input_wav, speaker_embeds, diarize_config, top_k, duration)
 
 
-def _identify_segmented(input_wav, speaker_embeds, segments) -> dict:
-    """Score each provided segment (WebVTT cue or manual) against speakers."""
-    global encoder
+def _score_top_k(scores: dict, top_k: int) -> list[dict]:
+    """Return sorted top_k speakers with scores."""
+    sorted_speakers = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [
+        {"voice_id": vid, "score": round(s, 4)}
+        for vid, s in sorted_speakers[:top_k]
+    ]
 
+
+def _identify_whole(input_wav, speaker_embeds, top_k, duration) -> dict:
+    """Score the entire audio as a single segment against all speakers."""
+    embed = encoder.embed_utterance(input_wav)
+    scores = {vid: float(np.dot(embed, spk)) for vid, spk in speaker_embeds.items()}
+
+    return {
+        "object": "speaker_identification",
+        "model": MODEL_ID,
+        "duration": round(duration, 3),
+        "segments": [{
+            "index": 0,
+            "start": 0.0,
+            "end": round(duration, 3),
+            "duration": round(duration, 3),
+            "top_speakers": _score_top_k(scores, top_k),
+            "scores": {vid: round(s, 4) for vid, s in scores.items()},
+        }],
+        "speaker_summary": _build_summary({vid: [scores[vid]] for vid in scores}),
+    }
+
+
+def _identify_segmented(input_wav, speaker_embeds, segments, top_k, duration) -> dict:
+    """Score each provided segment independently against speakers."""
     logger.info(f"Processing {len(segments)} segments")
     segment_results = []
+    all_scores = {vid: [] for vid in speaker_embeds}
 
     for seg in segments:
         start = float(seg["start"])
         end = float(seg["end"])
         seg_wav = slice_wav_segment(input_wav, start, end)
 
-        # Skip segments too short to embed (< 0.5s)
         min_samples = int(0.5 * sampling_rate)
         if len(seg_wav) < min_samples:
-            logger.warning(f"Segment {seg.get('index', '?')} too short ({len(seg_wav)} samples), skipping")
+            logger.warning(f"Segment {seg.get('index', '?')} too short, skipping")
             segment_results.append({
                 "index": seg.get("index"),
                 "start": start,
                 "end": end,
+                "duration": round(end - start, 3),
                 "text": seg.get("text", ""),
-                "speaker": seg.get("speaker"),
-                "scores": {name: 0.0 for name in speaker_embeds},
-                "best_match": None,
-                "best_score": 0.0,
+                "labeled_speaker": seg.get("speaker"),
+                "top_speakers": [],
+                "scores": {vid: 0.0 for vid in speaker_embeds},
                 "skipped": True,
             })
             continue
 
         seg_embed = encoder.embed_utterance(seg_wav)
-
         scores = {}
-        for name, spk_embed in speaker_embeds.items():
-            scores[name] = round(float(np.dot(seg_embed, spk_embed)), 4)
+        for vid, spk_embed in speaker_embeds.items():
+            s = float(np.dot(seg_embed, spk_embed))
+            scores[vid] = s
+            all_scores[vid].append(s)
 
-        best_name = max(scores, key=scores.get)
         segment_results.append({
             "index": seg.get("index"),
             "start": start,
             "end": end,
+            "duration": round(end - start, 3),
             "text": seg.get("text", ""),
-            "speaker": seg.get("speaker"),
-            "scores": scores,
-            "best_match": best_name,
-            "best_score": scores[best_name],
+            "labeled_speaker": seg.get("speaker"),
+            "top_speakers": _score_top_k(scores, top_k),
+            "scores": {vid: round(s, 4) for vid, s in scores.items()},
         })
 
     return {
-        "status": "success",
-        "mode": "segmented",
+        "object": "speaker_identification",
+        "model": MODEL_ID,
+        "duration": round(duration, 3),
         "num_segments": len(segment_results),
         "segments": segment_results,
+        "speaker_summary": _build_summary(all_scores),
     }
 
 
-def _identify_diarize(input_wav, speaker_embeds, input_data) -> dict:
-    """
-    Automatic continuous diarization using sliding-window partial embeddings.
-
-    Computes embeddings at a configurable rate across the entire audio,
-    scores each window against all speakers, then merges adjacent windows
-    with the same best speaker into contiguous segments.
-    """
-    global encoder
-
-    # Configurable parameters
-    rate = input_data.get("rate", 4)  # partial utterances per second
+def _identify_diarize(input_wav, speaker_embeds, input_data, top_k, duration) -> dict:
+    """Automatic sliding-window diarization."""
+    rate = input_data.get("rate", 4)
     threshold_confident = input_data.get("threshold_confident", 0.75)
     threshold_uncertain = input_data.get("threshold_uncertain", 0.65)
-    resolution = input_data.get("resolution", 0.5)  # seconds per bucket
+    resolution = input_data.get("resolution", 0.5)
 
-    duration = len(input_wav) / sampling_rate
     logger.info(f"Diarizing {duration:.1f}s of audio at rate={rate}")
 
-    # Compute continuous partial embeddings across the full audio
     _, cont_embeds, wav_splits = encoder.embed_utterance(
         input_wav, return_partials=True, rate=rate
     )
 
-    # Time midpoint for each partial embedding
     times = np.array([((s.start + s.stop) / 2) / sampling_rate for s in wav_splits])
-
-    # Compute similarity matrix: each speaker vs all partial embeddings
     speaker_names = list(speaker_embeds.keys())
     similarity_dict = {
-        name: cont_embeds @ embed for name, embed in speaker_embeds.items()
+        vid: cont_embeds @ embed for vid, embed in speaker_embeds.items()
     }
 
-    # Stack into matrix for argmax across speakers
-    all_sims = np.array([similarity_dict[name] for name in speaker_names])
-
-    # --- Build per-bucket speaker assignments at the given resolution ---
+    # Build per-bucket speaker assignments
     total_dur = times[-1]
     buckets = []
     for t_start in np.arange(0, total_dur, resolution):
@@ -412,16 +598,16 @@ def _identify_diarize(input_wav, speaker_embeds, input_data) -> dict:
         mask = (times >= t_start) & (times < t_end)
         if not mask.any():
             continue
-        avg_sims = {name: float(similarity_dict[name][mask].mean()) for name in speaker_names}
+        avg_sims = {vid: float(similarity_dict[vid][mask].mean()) for vid in speaker_names}
         best = max(avg_sims, key=avg_sims.get)
         score = avg_sims[best]
 
         if score > threshold_confident:
-            confidence = "confident"
+            confidence = "high"
         elif score > threshold_uncertain:
-            confidence = "uncertain"
+            confidence = "medium"
         else:
-            confidence = "none"
+            confidence = "low"
             best = None
 
         buckets.append({
@@ -430,157 +616,163 @@ def _identify_diarize(input_wav, speaker_embeds, input_data) -> dict:
             "speaker": best,
             "score": round(score, 4),
             "confidence": confidence,
-            "scores": {name: round(v, 4) for name, v in avg_sims.items()},
+            "scores": {vid: round(v, 4) for vid, v in avg_sims.items()},
         })
 
-    # --- Merge adjacent buckets with the same speaker into segments ---
+    # Merge adjacent buckets with the same speaker
     segments = []
     if buckets:
         current = {
             "start": buckets[0]["start"],
             "end": buckets[0]["end"],
             "speaker": buckets[0]["speaker"],
-            "scores_sum": {name: buckets[0]["scores"][name] for name in speaker_names},
+            "scores_sum": {vid: buckets[0]["scores"][vid] for vid in speaker_names},
             "bucket_count": 1,
         }
 
         for b in buckets[1:]:
             if b["speaker"] == current["speaker"] and b["speaker"] is not None:
                 current["end"] = b["end"]
-                for name in speaker_names:
-                    current["scores_sum"][name] += b["scores"][name]
+                for vid in speaker_names:
+                    current["scores_sum"][vid] += b["scores"][vid]
                 current["bucket_count"] += 1
             else:
-                # Finalize current segment
                 segments.append(_finalize_segment(
-                    current, speaker_names, threshold_confident, threshold_uncertain
+                    current, speaker_names, threshold_confident, threshold_uncertain, top_k
                 ))
                 current = {
                     "start": b["start"],
                     "end": b["end"],
                     "speaker": b["speaker"],
-                    "scores_sum": {name: b["scores"][name] for name in speaker_names},
+                    "scores_sum": {vid: b["scores"][vid] for vid in speaker_names},
                     "bucket_count": 1,
                 }
 
-        # Finalize last segment
         segments.append(_finalize_segment(
-            current, speaker_names, threshold_confident, threshold_uncertain
+            current, speaker_names, threshold_confident, threshold_uncertain, top_k
         ))
 
-    # --- Per-speaker summary stats ---
-    speaker_summary = {}
-    for name in speaker_names:
-        sims = similarity_dict[name]
-        speaker_summary[name] = {
-            "min": round(float(sims.min()), 4),
-            "max": round(float(sims.max()), 4),
-            "mean": round(float(sims.mean()), 4),
-        }
+    # Per-speaker summary
+    all_scores = {}
+    for vid in speaker_names:
+        sims = similarity_dict[vid]
+        all_scores[vid] = sims.tolist()
 
     return {
-        "status": "success",
-        "mode": "diarize",
+        "object": "speaker_identification",
+        "model": MODEL_ID,
         "duration": round(duration, 3),
         "num_segments": len(segments),
         "segments": segments,
-        "speaker_summary": speaker_summary,
+        "speaker_summary": _build_summary(all_scores),
     }
 
 
-def _finalize_segment(current, speaker_names, threshold_confident, threshold_uncertain):
-    """Convert a merged bucket group into a final segment dict."""
+def _finalize_segment(current, speaker_names, threshold_confident, threshold_uncertain, top_k):
     n = current["bucket_count"]
-    avg_scores = {name: round(current["scores_sum"][name] / n, 4) for name in speaker_names}
+    avg_scores = {vid: round(current["scores_sum"][vid] / n, 4) for vid in speaker_names}
     best_score = avg_scores[current["speaker"]] if current["speaker"] else 0.0
 
     if best_score > threshold_confident:
-        confidence = "confident"
+        confidence = "high"
     elif best_score > threshold_uncertain:
-        confidence = "uncertain"
+        confidence = "medium"
     else:
-        confidence = "none"
+        confidence = "low"
 
     return {
         "start": current["start"],
         "end": current["end"],
         "duration": round(current["end"] - current["start"], 3),
         "speaker": current["speaker"],
-        "score": best_score,
         "confidence": confidence,
+        "top_speakers": _score_top_k(avg_scores, top_k),
         "scores": avg_scores,
     }
 
 
-def handle_embed(input_data: dict) -> dict:
-    """Generate voice embedding(s) for one or more audio files."""
+def _build_summary(all_scores: dict) -> dict:
+    """Build per-speaker summary stats from collected scores."""
+    summary = {}
+    for vid, scores_list in all_scores.items():
+        if not scores_list:
+            summary[vid] = {"min": 0.0, "max": 0.0, "mean": 0.0}
+            continue
+        arr = np.array(scores_list)
+        summary[vid] = {
+            "min": round(float(arr.min()), 4),
+            "max": round(float(arr.max()), 4),
+            "mean": round(float(arr.mean()), 4),
+        }
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+ENDPOINT_HANDLERS = {
+    "/v1/embeddings": handle_embeddings_create,
+    "/v1/embeddings/get": handle_embeddings_get,
+    "/v1/embeddings/delete": handle_embeddings_delete,
+    "/v1/audio/identify": handle_audio_identify,
+}
+
+
+def handler(event):
+    """RunPod serverless handler — routes to endpoint handlers."""
     global encoder
 
-    embeddings = []
+    input_data = event["input"]
+    endpoint = input_data.get("endpoint", "/v1/audio/identify")
 
-    # Multiple files
-    audio_files = input_data.get("audio_files", [])
-    if audio_files:
-        for i, audio_spec in enumerate(audio_files):
-            path = resolve_audio(audio_spec, "audio")
-            wav = preprocess_wav(path)
-            embed = encoder.embed_utterance(wav)
-            embeddings.append({
-                "index": i,
-                "embedding": embed.tolist(),
-            })
-    else:
-        # Single file
-        path = resolve_audio(input_data, "audio")
-        wav = preprocess_wav(path)
-        embed = encoder.embed_utterance(wav)
-        embeddings.append({
-            "index": 0,
-            "embedding": embed.tolist(),
-        })
+    logger.info(f"Request: endpoint={endpoint}")
 
-    return {
-        "status": "success",
-        "embeddings": embeddings,
-        "embedding_size": 256,
-    }
+    try:
+        handler_fn = ENDPOINT_HANDLERS.get(endpoint)
+        if not handler_fn:
+            return {
+                "error": {
+                    "message": f"Unknown endpoint: {endpoint}. "
+                    f"Available: {', '.join(ENDPOINT_HANDLERS.keys())}",
+                    "type": "invalid_request_error",
+                },
+            }
+
+        return handler_fn(input_data)
+
+    except ValueError as e:
+        return {
+            "error": {
+                "message": str(e),
+                "type": "invalid_request_error",
+            },
+        }
+    except Exception as e:
+        logger.error(f"Error processing request: {e}", exc_info=True)
+        return {
+            "error": {
+                "message": str(e),
+                "type": "server_error",
+            },
+        }
 
 
-def handle_compare(input_data: dict) -> dict:
-    """Compare two audio files and return similarity."""
-    global encoder
-
-    path_a = resolve_audio(input_data, "audio_a")
-    path_b = resolve_audio(input_data, "audio_b")
-
-    wav_a = preprocess_wav(path_a)
-    wav_b = preprocess_wav(path_b)
-
-    embed_a = encoder.embed_utterance(wav_a)
-    embed_b = encoder.embed_utterance(wav_b)
-
-    similarity = float(np.dot(embed_a, embed_b))
-
-    return {
-        "status": "success",
-        "similarity": round(similarity, 4),
-    }
+# ---------------------------------------------------------------------------
+# Init
+# ---------------------------------------------------------------------------
 
 
 def initialize_model():
-    """Initialize the VoiceEncoder model."""
     global encoder
     try:
         logger.info("Initializing VoiceEncoder model...")
-
-        # Check for custom weights path
         weights_path = os.environ.get("RESEMBLYZER_WEIGHTS_PATH")
         if weights_path and Path(weights_path).exists():
             logger.info(f"Loading custom weights from: {weights_path}")
             encoder = VoiceEncoder(weights_fpath=weights_path)
         else:
             encoder = VoiceEncoder()
-
         logger.info("VoiceEncoder initialized successfully.")
         return True
     except Exception as e:
