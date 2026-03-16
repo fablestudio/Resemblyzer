@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  resemblyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile.runpod
+    ports:
+      - "8000:8000"
+    volumes:
+      - audio_cache:/app/audio_cache
+    environment:
+      - RUNPOD_DEBUG_LEVEL=DEBUG
+
+volumes:
+  audio_cache:
