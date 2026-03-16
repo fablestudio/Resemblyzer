@@ -1,0 +1,29 @@
+# ============================================================================
+# RESEMBLYZER - REQUIREMENTS FOR RUNPOD DEPLOYMENT
+# ============================================================================
+# CPU-only deployment (the voice encoder is lightweight and runs fine on CPU)
+# For GPU support, uncomment the CUDA torch line and comment out the CPU one.
+
+# --- PyTorch ---
+# CPU-only (default - Resemblyzer runs 1000x real-time on CPU, GPU is optional)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+
+# For NVIDIA GPU with CUDA 12.4 (uncomment the lines below and remove the CPU lines above):
+# --extra-index-url https://download.pytorch.org/whl/cu124
+# torch==2.5.1+cu124
+
+# --- Core Resemblyzer Dependencies ---
+librosa>=0.9.1
+numpy>=1.20.0
+webrtcvad>=2.0.10
+scipy>=1.2.1
+
+# --- Audio I/O ---
+soundfile
+
+# --- HTTP & Networking ---
+requests
+
+# --- RunPod ---
+runpod>=1.7.7

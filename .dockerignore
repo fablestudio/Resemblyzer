@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Audio data (large, not needed in container)
+audio_data/
+
+# Demo files
+demo*.py
+demo_utils.py
+plots/
+
+# Python artifacts
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist/
+build/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docs
+README.md
+LICENSE
+
+# Misc
+*.md
+!requirements*.txt

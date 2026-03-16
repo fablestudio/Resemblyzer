@@ -1,0 +1,7 @@
+{
+  "input": {
+    "mode": "compare",
+    "audio_a_url": "https://upload.wikimedia.org/wikipedia/commons/2/22/George_W._Bush_Columbia_FINAL.ogg",
+    "audio_b_url": "https://upload.wikimedia.org/wikipedia/commons/2/22/George_W._Bush_Columbia_FINAL.ogg"
+  }
+}
