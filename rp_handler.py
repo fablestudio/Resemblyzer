@@ -115,12 +115,9 @@ def resolve_audio(spec: dict, key_prefix: str = "audio") -> str:
         return p
     elif url_key in spec and spec[url_key]:
         url = spec[url_key]
-        if url.startswith("/") or url.startswith("file://"):
-            local_path = url.replace("file://", "")
-            if not Path(local_path).exists():
-                raise ValueError(f"Local file not found: {local_path}")
-            return local_path
-        return download_cached_audio(url)
+        # Delegate URL (or local path) resolution to the shared helper so that
+        # Docker localhost rewriting is consistently applied.
+        return resolve_audio_url(url)
     elif b64_key in spec and spec[b64_key]:
         return decode_base64_audio(spec[b64_key], f"{key_prefix}.wav")
     else:
