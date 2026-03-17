@@ -1,12 +1,10 @@
 """
-RunPod serverless handler for Resemblyzer — OpenAI-compatible voice API.
+RunPod serverless handler for Resemblyzer — stateless voice audio processing.
 
 Endpoints (routed via "endpoint" field in input):
 
-  POST /v1/embeddings          — Generate and store voice embeddings
-  POST /v1/embeddings/get      — Retrieve stored voice embedding by voice_id
-  POST /v1/embeddings/delete   — Delete a stored voice embedding
-  POST /v1/audio/identify      — Speaker identification with confidence scores
+  POST /v1/embeddings       — Generate voice embeddings from audio
+  POST /v1/audio/identify   — Speaker identification using provided reference embeddings or audio URLs
 """
 
 import runpod
@@ -20,7 +18,6 @@ from pathlib import Path
 
 from resemblyzer import VoiceEncoder, preprocess_wav
 from resemblyzer.hparams import sampling_rate
-import supabase_client as db
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -43,7 +40,7 @@ DOWNLOAD_READ_TIMEOUT_SECONDS = 60
 MAX_AUDIO_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# Audio helpers (unchanged core logic)
+# Audio helpers
 # ---------------------------------------------------------------------------
 
 
@@ -152,28 +149,11 @@ def resolve_audio(spec: dict, key_prefix: str = "audio") -> str:
             raise ValueError(f"Local file not found: {p}")
         return p
     elif url_key in spec and spec[url_key]:
-        url = spec[url_key]
-        # Delegate URL (or local path) resolution to the shared helper so that
-        # Docker localhost rewriting is consistently applied.
-        return resolve_audio_url(url)
+        return resolve_audio_url(spec[url_key])
     elif b64_key in spec and spec[b64_key]:
         return decode_base64_audio(spec[b64_key], f"{key_prefix}.wav")
     else:
         raise ValueError(f"No audio source provided. Expected '{url_key}', '{b64_key}', or '{path_key}'.")
-
-
-def rewrite_url_for_docker(url: str) -> str:
-    """Rewrite localhost/127.0.0.1 URLs to use host.docker.internal when running in Docker."""
-    import re as _re
-    supabase_url = os.environ.get("SUPABASE_URL", "")
-    if "host.docker.internal" in supabase_url:
-        # Extract the host:port from SUPABASE_URL to use as replacement
-        from urllib.parse import urlparse
-        parsed = urlparse(supabase_url)
-        docker_host = f"{parsed.scheme}://{parsed.netloc}"
-        # Replace localhost variants in the URL
-        url = _re.sub(r"https?://(localhost|127\.0\.0\.1)(:\d+)?", docker_host, url)
-    return url
 
 
 def resolve_audio_url(url: str) -> str:
@@ -183,7 +163,6 @@ def resolve_audio_url(url: str) -> str:
         if not Path(local_path).exists():
             raise ValueError(f"Local file not found: {local_path}")
         return local_path
-    url = rewrite_url_for_docker(url)
     return download_cached_audio(url)
 
 
@@ -261,7 +240,7 @@ def slice_wav_segment(wav: np.ndarray, start: float, end: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Embedding generation helper
+# Embedding generation
 # ---------------------------------------------------------------------------
 
 
@@ -271,31 +250,6 @@ def generate_embedding(audio_path: str) -> np.ndarray:
     return encoder.embed_utterance(wav)
 
 
-def resolve_voice_embedding(voice_id: str) -> np.ndarray:
-    """
-    Get embedding for a voice_id:
-      1. Check Supabase voice_embeddings table
-      2. If missing, look up preview_url from voices table, generate, and store
-      3. If no preview_url, raise an error
-    """
-    stored = db.get_voice_embedding(voice_id)
-    if stored is not None:
-        return np.array(stored, dtype=np.float32)
-
-    preview_url = db.get_voice_preview_url(voice_id)
-    if not preview_url:
-        raise ValueError(
-            f"voice_id '{voice_id}' has no stored embedding and no preview_url. "
-            f"Provide a reference audio URL or create an embedding first."
-        )
-
-    logger.info(f"Generating embedding for voice_id={voice_id} from preview_url")
-    audio_path = resolve_audio_url(preview_url)
-    embed = generate_embedding(audio_path)
-    db.store_voice_embedding(voice_id, embed.tolist())
-    return embed
-
-
 # ---------------------------------------------------------------------------
 # Endpoint: POST /v1/embeddings
 # ---------------------------------------------------------------------------
@@ -303,16 +257,14 @@ def resolve_voice_embedding(voice_id: str) -> np.ndarray:
 
 def handle_embeddings_create(input_data: dict) -> dict:
     """
-    Generate voice embedding(s) and optionally store in Supabase.
+    Generate voice embeddings from audio. Pure compute — no DB interaction.
 
-        Input:
-            voice_id: str (optional — if provided, stores in DB)
-            audio_url / audio_base64 / audio_path: audio source (optional if voice_id has preview_url)
-            audio_files: list of {voice_id?, audio_url/audio_base64/audio_path} for batch
+    Input:
+      audio_url / audio_base64 / audio_path: audio source
+      audio_files: list of {audio_url/audio_base64/audio_path} for batch
 
     Response (OpenAI-compatible):
-      { object: "list", data: [{object: "embedding", index, embedding, voice_id?}],
-        model, usage }
+      { object: "list", data: [{object: "embedding", index, embedding}], model, usage }
     """
     audio_files = input_data.get("audio_files", [])
     if not audio_files:
@@ -320,38 +272,13 @@ def handle_embeddings_create(input_data: dict) -> dict:
 
     results = []
     for i, item in enumerate(audio_files):
-        voice_id = item.get("voice_id")
-
-        # Resolve audio: explicit audio > preview_url from DB
-        audio_path = None
-        has_audio = (
-            item.get("audio_url") or item.get("audio_base64") or item.get("audio_path")
-        )
-        if has_audio:
-            audio_path = resolve_audio(item, "audio")
-        elif voice_id:
-            preview_url = db.get_voice_preview_url(voice_id)
-            if preview_url:
-                audio_path = resolve_audio_url(preview_url)
-            else:
-                raise ValueError(
-                    f"No audio provided and voice_id '{voice_id}' has no preview_url"
-                )
-        else:
-            raise ValueError(
-                f"Item {i}: provide audio_url/audio_base64/audio_path or a voice_id with a preview_url"
-            )
-
+        audio_path = resolve_audio(item, "audio")
         embed = generate_embedding(audio_path)
-
-        if voice_id:
-            db.store_voice_embedding(voice_id, embed.tolist())
 
         results.append({
             "object": "embedding",
             "index": i,
             "embedding": embed.tolist(),
-            "voice_id": voice_id,
         })
 
     return {
@@ -359,65 +286,6 @@ def handle_embeddings_create(input_data: dict) -> dict:
         "data": results,
         "model": MODEL_ID,
         "usage": {"prompt_tokens": 0, "total_tokens": 0},
-    }
-
-
-# ---------------------------------------------------------------------------
-# Endpoint: POST /v1/embeddings/get
-# ---------------------------------------------------------------------------
-
-
-def handle_embeddings_get(input_data: dict) -> dict:
-    """
-    Retrieve a stored voice embedding. Auto-generates from preview_url if missing.
-
-    Input:
-      voice_id: str (required)
-
-    Response (OpenAI-compatible):
-      { object: "list", data: [{object: "embedding", index, embedding, voice_id}],
-        model, usage }
-    """
-    voice_id = input_data.get("voice_id")
-    if not voice_id:
-        raise ValueError("voice_id is required")
-
-    embed = resolve_voice_embedding(voice_id)
-
-    return {
-        "object": "list",
-        "data": [{
-            "object": "embedding",
-            "index": 0,
-            "embedding": embed.tolist(),
-            "voice_id": voice_id,
-        }],
-        "model": MODEL_ID,
-        "usage": {"prompt_tokens": 0, "total_tokens": 0},
-    }
-
-
-# ---------------------------------------------------------------------------
-# Endpoint: POST /v1/embeddings/delete
-# ---------------------------------------------------------------------------
-
-
-def handle_embeddings_delete(input_data: dict) -> dict:
-    """
-    Delete a stored voice embedding.
-
-    Input:
-      voice_id: str (required)
-    """
-    voice_id = input_data.get("voice_id")
-    if not voice_id:
-        raise ValueError("voice_id is required")
-
-    deleted = db.delete_voice_embedding(voice_id)
-    return {
-        "deleted": deleted,
-        "voice_id": voice_id,
-        "object": "embedding.deleted",
     }
 
 
@@ -430,60 +298,78 @@ def handle_audio_identify(input_data: dict) -> dict:
     """
     Speaker identification with per-segment confidence scores.
 
+    Reference speakers can be provided as:
+      - Pre-computed embeddings: reference_embeddings: {voice_id: [float...], ...}
+      - Audio URLs to embed on-the-fly: reference_audio_urls: {voice_id: "https://...", ...}
+      - Mix of both (embeddings take precedence)
+
     Input:
       audio_url / audio_base64: input audio to analyze
-      voice_ids: list of voice_id strings — embeddings fetched/generated from DB
-      top_k: int (default 5) — max speakers per segment
-      segmentation: "whole" | "auto" | {rate, resolution, threshold_*, ...} | webvtt string | list of segments
-      rate: int (default 4) — partials/sec for auto mode
-      resolution: float (default 0.5) — bucket size for auto mode
-      threshold_confident: float (default 0.75)
-      threshold_uncertain: float (default 0.65)
+      reference_embeddings: dict {voice_id: [256 floats]} — pre-computed embeddings
+      reference_audio_urls: dict {voice_id: "url"} — audio to embed on-the-fly
+      top_k: int (default 5)
+      segmentation: "whole" | "auto" | {rate, resolution, ...} | webvtt string | list of segments
 
     Response:
-      { segments: [...], speakers: {...}, duration, model }
+      { object, model, duration, segments, speaker_summary, generated_embeddings? }
     """
     # Resolve input audio
     input_path = resolve_audio(input_data, "audio")
     input_wav = preprocess_wav(input_path)
     duration = len(input_wav) / sampling_rate
 
-    # Resolve speaker embeddings from voice_ids
-    voice_ids = input_data.get("voice_ids", [])
-    if not voice_ids:
-        raise ValueError("voice_ids is required and must be a non-empty list")
+    # Build speaker embeddings from provided data
+    ref_embeddings = input_data.get("reference_embeddings", {})
+    ref_audio_urls = input_data.get("reference_audio_urls", {})
+
+    if not ref_embeddings and not ref_audio_urls:
+        raise ValueError(
+            "Provide reference_embeddings and/or reference_audio_urls with at least one speaker"
+        )
 
     top_k = input_data.get("top_k", 5)
 
     speaker_embeds = {}
-    errors = []
-    for vid in voice_ids:
-        try:
-            speaker_embeds[vid] = resolve_voice_embedding(vid)
-        except ValueError as e:
-            errors.append(str(e))
+    generated_embeddings = {}
 
-    if errors:
-        raise ValueError(
-            f"Failed to resolve {len(errors)} voice(s): " + "; ".join(errors)
-        )
+    # Load pre-computed embeddings
+    for vid, emb in ref_embeddings.items():
+        speaker_embeds[vid] = np.array(emb, dtype=np.float32)
+
+    # Generate embeddings from audio URLs (only for voices not already provided)
+    for vid, url in ref_audio_urls.items():
+        if vid in speaker_embeds:
+            continue
+        audio_path = resolve_audio_url(url)
+        embed = generate_embedding(audio_path)
+        speaker_embeds[vid] = embed
+        # Return newly generated embeddings so the caller can cache them
+        generated_embeddings[vid] = embed.tolist()
+
+    if not speaker_embeds:
+        raise ValueError("No valid speaker references could be resolved")
 
     # Determine segmentation mode
     segmentation = input_data.get("segmentation", "auto")
 
     if segmentation == "whole":
-        return _identify_whole(input_wav, speaker_embeds, top_k, duration)
+        result = _identify_whole(input_wav, speaker_embeds, top_k, duration)
     elif isinstance(segmentation, str) and segmentation.strip().startswith("WEBVTT"):
         segments = parse_webvtt(segmentation)
-        return _identify_segmented(input_wav, speaker_embeds, segments, top_k, duration)
+        result = _identify_segmented(input_wav, speaker_embeds, segments, top_k, duration)
     elif isinstance(segmentation, list):
-        return _identify_segmented(input_wav, speaker_embeds, segmentation, top_k, duration)
+        result = _identify_segmented(input_wav, speaker_embeds, segmentation, top_k, duration)
     else:
         diarize_config = input_data
         if isinstance(segmentation, dict):
             diarize_config = {**input_data, **segmentation}
+        result = _identify_diarize(input_wav, speaker_embeds, diarize_config, top_k, duration)
 
-        return _identify_diarize(input_wav, speaker_embeds, diarize_config, top_k, duration)
+    # Attach any newly generated embeddings so the caller can store them
+    if generated_embeddings:
+        result["generated_embeddings"] = generated_embeddings
+
+    return result
 
 
 def _score_top_k(scores: dict, top_k: int) -> list[dict]:
@@ -713,8 +599,6 @@ def _build_summary(all_scores: dict) -> dict:
 
 ENDPOINT_HANDLERS = {
     "/v1/embeddings": handle_embeddings_create,
-    "/v1/embeddings/get": handle_embeddings_get,
-    "/v1/embeddings/delete": handle_embeddings_delete,
     "/v1/audio/identify": handle_audio_identify,
 }
 
@@ -780,10 +664,51 @@ def initialize_model():
         return False
 
 
+def start_local_server(port: int = 8000):
+    """Start a local FastAPI server that mimics RunPod's /runsync endpoint."""
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    import uvicorn
+    import uuid
+
+    app = FastAPI(title="Resemblyzer Voice API (local)")
+
+    @app.post("/runsync")
+    @app.post("/run")
+    async def runsync(request: Request):
+        body = await request.json()
+        job_id = str(uuid.uuid4())[:8]
+        try:
+            output = handler({"input": body.get("input", body)})
+            return JSONResponse({
+                "id": job_id,
+                "status": "COMPLETED",
+                "output": output,
+            })
+        except Exception as e:
+            return JSONResponse({
+                "id": job_id,
+                "status": "FAILED",
+                "error": str(e),
+            }, status_code=500)
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "model": MODEL_ID}
+
+    logger.info(f"Starting local server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
 if __name__ == "__main__":
-    if initialize_model():
+    if not initialize_model():
+        logger.error("Failed to initialize model. Exiting.")
+        exit(1)
+
+    # RunPod production: use serverless handler
+    # Local dev: start FastAPI server on port 8000
+    if os.environ.get("RUNPOD_POD_ID") or os.environ.get("RUNPOD_API_KEY"):
         logger.info("Starting RunPod serverless handler...")
         runpod.serverless.start({"handler": handler})
     else:
-        logger.error("Failed to initialize model. Exiting.")
-        exit(1)
+        start_local_server(port=int(os.environ.get("PORT", "8000")))

@@ -25,8 +25,9 @@ soundfile
 # --- HTTP & Networking ---
 requests
 
-# --- Supabase ---
-supabase>=2.0.0
+# --- Local dev server ---
+fastapi>=0.100.0
+uvicorn>=0.20.0
 
 # --- RunPod ---
 runpod>=1.7.7
